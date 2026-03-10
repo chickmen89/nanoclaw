@@ -69,7 +69,11 @@ vi.mock('grammy', () => ({
   },
 }));
 
-import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import {
+  TelegramChannel,
+  TelegramChannelOpts,
+  convertToTelegramMarkdownV2,
+} from './telegram.js';
 
 // --- Test helpers ---
 
@@ -700,7 +704,7 @@ describe('TelegramChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
-    it('sends message via bot API', async () => {
+    it('sends message via bot API with MarkdownV2', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -710,6 +714,7 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '100200300',
         'Hello',
+        { parse_mode: 'MarkdownV2' },
       );
     });
 
@@ -723,6 +728,7 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '-1001234567890',
         'Group message',
+        { parse_mode: 'MarkdownV2' },
       );
     });
 
@@ -731,6 +737,7 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
+      // Use chars with no MarkdownV2 escaping so length stays the same
       const longText = 'x'.repeat(5000);
       await channel.sendMessage('tg:100200300', longText);
 
@@ -739,11 +746,13 @@ describe('TelegramChannel', () => {
         1,
         '100200300',
         'x'.repeat(4096),
+        { parse_mode: 'MarkdownV2' },
       );
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         2,
         '100200300',
         'x'.repeat(904),
+        { parse_mode: 'MarkdownV2' },
       );
     });
 
@@ -758,12 +767,34 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledTimes(1);
     });
 
-    it('handles send failure gracefully', async () => {
+    it('falls back to plain text when MarkdownV2 fails', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
+      // First call (MarkdownV2) fails, second call (plain) succeeds
       currentBot().api.sendMessage.mockRejectedValueOnce(
+        new Error('Parse error'),
+      );
+
+      await channel.sendMessage('tg:100200300', 'Will retry');
+
+      expect(currentBot().api.sendMessage).toHaveBeenCalledTimes(2);
+      // Second call: plain text without parse_mode
+      expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
+        2,
+        '100200300',
+        'Will retry',
+      );
+    });
+
+    it('handles complete send failure gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      // Both MarkdownV2 and plain text fail
+      currentBot().api.sendMessage.mockRejectedValue(
         new Error('Network error'),
       );
 
@@ -928,5 +959,172 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', createTestOpts());
       expect(channel.name).toBe('telegram');
     });
+  });
+});
+
+// --- MarkdownV2 conversion ---
+
+describe('convertToTelegramMarkdownV2', () => {
+  it('passes plain text through with special chars escaped', () => {
+    expect(convertToTelegramMarkdownV2('Hello world')).toBe('Hello world');
+    expect(convertToTelegramMarkdownV2('Price: $10.00')).toBe(
+      'Price: $10\\.00',
+    );
+    expect(convertToTelegramMarkdownV2('a + b = c')).toBe('a \\+ b \\= c');
+  });
+
+  it('escapes all MarkdownV2 special characters', () => {
+    expect(convertToTelegramMarkdownV2('chars: _[]()~>#+-=|{}.!')).toBe(
+      'chars: \\_\\[\\]\\(\\)\\~\\>\\#\\+\\-\\=\\|\\{\\}\\.\\!',
+    );
+  });
+
+  it('converts fenced code blocks', () => {
+    const input = '```\nconsole.log("hi")\n```';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('```\nconsole.log("hi")\n```');
+  });
+
+  it('converts fenced code blocks with language', () => {
+    const input = '```typescript\nconst x = 1;\n```';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('```typescript\nconst x = 1;\n```');
+  });
+
+  it('preserves backticks inside code blocks via escaping', () => {
+    const input = '```\nconst s = `hello`;\n```';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('```\nconst s = \\`hello\\`;\n```');
+  });
+
+  it('converts inline code', () => {
+    const input = 'Use `npm install` to install';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('Use `npm install` to install');
+  });
+
+  it('converts **bold** to TG bold', () => {
+    const input = 'This is **bold** text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is *bold* text');
+  });
+
+  it('converts __bold__ to TG bold', () => {
+    const input = 'This is __bold__ text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is *bold* text');
+  });
+
+  it('converts *italic* to TG italic', () => {
+    const input = 'This is *italic* text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is _italic_ text');
+  });
+
+  it('converts _italic_ to TG italic', () => {
+    const input = 'This is _italic_ text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is _italic_ text');
+  });
+
+  it('converts ~~strikethrough~~ to TG strikethrough', () => {
+    const input = 'This is ~~deleted~~ text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is ~deleted~ text');
+  });
+
+  it('converts ~strikethrough~ (single tilde) to TG strikethrough', () => {
+    const input = 'This is ~deleted~ text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is ~deleted~ text');
+  });
+
+  it('converts ||spoiler|| to TG spoiler', () => {
+    const input = 'This is ||secret|| text';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('This is ||secret|| text');
+  });
+
+  it('converts ***bold italic*** to TG bold italic', () => {
+    const input = '***bold italic***';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('*_bold italic_*');
+  });
+
+  it('converts **_bold italic_** to TG bold italic', () => {
+    const input = '**_bold italic_**';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('*_bold italic_*');
+  });
+
+  it('converts headings to bold', () => {
+    expect(convertToTelegramMarkdownV2('# Title')).toBe('*Title*');
+    expect(convertToTelegramMarkdownV2('## Subtitle')).toBe('*Subtitle*');
+    expect(convertToTelegramMarkdownV2('### Section')).toBe('*Section*');
+  });
+
+  it('converts horizontal rules to unicode line', () => {
+    expect(convertToTelegramMarkdownV2('---')).toBe('─────────────────');
+    expect(convertToTelegramMarkdownV2('-----')).toBe('─────────────────');
+  });
+
+  it('converts blockquotes', () => {
+    expect(convertToTelegramMarkdownV2('> This is a quote')).toBe(
+      '>This is a quote',
+    );
+  });
+
+  it('converts list markers to bullets', () => {
+    const input = '- item 1\n- item 2\n* item 3';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('• item 1\n• item 2\n• item 3');
+  });
+
+  it('converts links', () => {
+    const input = 'Visit [Google](https://google.com)';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('Visit [Google](https://google.com)');
+  });
+
+  it('escapes special chars inside link text', () => {
+    const input = '[foo.bar](https://example.com)';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('[foo\\.bar](https://example.com)');
+  });
+
+  it('converts tables to code blocks', () => {
+    const input = '| A | B |\n|---|---|\n| 1 | 2 |';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('```\n| A | B |\n|---|---|\n| 1 | 2 |\n```');
+  });
+
+  it('escapes special chars in bold content', () => {
+    const input = '**hello.world**';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('*hello\\.world*');
+  });
+
+  it('handles mixed formatting', () => {
+    const input = '# Welcome\n\nThis is **bold** and *italic*.\n\n- item 1\n- item 2';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toContain('*Welcome*');
+    expect(result).toContain('*bold*');
+    expect(result).toContain('_italic_');
+    expect(result).toContain('• item 1');
+    expect(result).toContain('• item 2');
+  });
+
+  it('handles code blocks alongside regular text', () => {
+    const input = 'Run this:\n```\nnpm install\n```\nDone.';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toContain('```\nnpm install\n```');
+    expect(result).toContain('Done\\.');
+  });
+
+  it('does not double-escape already-escaped content', () => {
+    // Plain text with backslash
+    const input = 'path\\to\\file';
+    const result = convertToTelegramMarkdownV2(input);
+    expect(result).toBe('path\\\\to\\\\file');
   });
 });

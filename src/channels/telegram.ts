@@ -1,6 +1,9 @@
-import { Bot } from 'grammy';
+import fs from 'fs';
+import path from 'path';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { Bot, InputFile } from 'grammy';
+
+import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -17,6 +20,103 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+/**
+ * Convert standard Markdown to Telegram MarkdownV2 format.
+ * Handles code blocks, inline code, tables, headings, bold, italic,
+ * strikethrough, links, blockquotes, horizontal rules, and list markers.
+ */
+export function convertToTelegramMarkdownV2(text: string): string {
+  const phs: string[] = [];
+  const ph = (v: string): string => {
+    const i = phs.length;
+    phs.push(v);
+    return `\x00${i}\x00`;
+  };
+  const esc = (s: string): string =>
+    s.replace(/[_*\[\]()~`>#+=|{}.!\-\\]/g, '\\$&');
+
+  // 1. Fenced code blocks → placeholders (preserve content as-is)
+  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const e = code.replace(/\\/g, '\\\\').replace(/`/g, '\\`');
+    return ph(lang ? `\`\`\`${lang}\n${e}\`\`\`` : `\`\`\`\n${e}\`\`\``);
+  });
+
+  // 2. Inline code → placeholders
+  text = text.replace(/`([^`]+)`/g, (_, code) => {
+    const e = code.replace(/\\/g, '\\\\').replace(/`/g, '\\`');
+    return ph(`\`${e}\``);
+  });
+
+  // 3. Tables (2+ consecutive |…| lines) → code block placeholders
+  text = text.replace(/(^\|[^\n]*\|(?:\n\|[^\n]*\|)+)/gm, (match) => {
+    const e = match.replace(/\\/g, '\\\\').replace(/`/g, '\\`');
+    return ph(`\`\`\`\n${e}\n\`\`\``);
+  });
+
+  // 4. Links: [text](url) → placeholders
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) =>
+    ph(
+      `[${esc(t)}](${u.replace(/\\/g, '\\\\').replace(/\)/g, '\\)')})`,
+    ),
+  );
+
+  // 5. Headings → temporary **bold** (converted to TG bold below)
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, '**$1**');
+
+  // 6. Horizontal rules → unicode line
+  text = text.replace(/^-{3,}$/gm, '─────────────────');
+  text = text.replace(/^\*{3,}$/gm, '─────────────────');
+
+  // 7. List markers → bullet (before italic to avoid * conflicts)
+  text = text.replace(/^(\s*)\*\s/gm, '$1• ');
+  text = text.replace(/^(\s*)[+-]\s/gm, '$1• ');
+
+  // 8. Spoiler: ||text|| → TG spoiler (MarkdownV2 native)
+  text = text.replace(/\|\|(.+?)\|\|/g, (_, c) => ph(`||${esc(c)}||`));
+
+  // 9. Strikethrough: ~~text~~ or ~text~ → TG ~text~
+  text = text.replace(/~~(.+?)~~/g, (_, c) => ph(`~${esc(c)}~`));
+  text = text.replace(/(?<!~)~([^~\n]+)~(?!~)/g, (_, c) =>
+    ph(`~${esc(c)}~`),
+  );
+
+  // 10. Bold+Italic: ***text*** or **_text_** → TG bold italic *_text_*
+  text = text.replace(/\*\*\*(.+?)\*\*\*/g, (_, c) =>
+    ph(`*_${esc(c)}_*`),
+  );
+  text = text.replace(/\*\*_(.+?)_\*\*/g, (_, c) =>
+    ph(`*_${esc(c)}_*`),
+  );
+
+  // 11. Bold: **text** or __text__ → TG bold *text*
+  text = text.replace(/\*\*(.+?)\*\*/g, (_, c) => ph(`*${esc(c)}*`));
+  text = text.replace(/__(.+?)__/g, (_, c) => ph(`*${esc(c)}*`));
+
+  // 12. Italic: *text* or _text_ → TG italic _text_
+  text = text.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, (_, c) =>
+    ph(`_${esc(c)}_`),
+  );
+  text = text.replace(/(?<!_)_([^_\n]+)_(?!_)/g, (_, c) =>
+    ph(`_${esc(c)}_`),
+  );
+
+  // 13. Blockquote: > text → marker (restore after escaping)
+  text = text.replace(/^>\s?/gm, '\x01');
+
+  // 14. Escape remaining special chars in plain text
+  text = esc(text);
+
+  // 15. Restore blockquote markers
+  text = text.replace(/\x01/g, '>');
+
+  // 16. Restore all placeholders (reverse order for nested)
+  for (let i = phs.length - 1; i >= 0; i--) {
+    text = text.replace(`\x00${i}\x00`, phs[i]);
+  }
+
+  return text;
+}
+
 export class TelegramChannel implements Channel {
   name = 'telegram';
 
@@ -27,6 +127,45 @@ export class TelegramChannel implements Channel {
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
+  }
+
+  /**
+   * Download a file from Telegram servers into the group's IPC files directory.
+   * Returns the container-side path (e.g., /workspace/ipc/files/photo-123.jpg)
+   * or null on failure.
+   */
+  private async downloadFile(
+    fileId: string,
+    groupFolder: string,
+    prefix: string,
+    originalName?: string,
+  ): Promise<string | null> {
+    if (!this.bot) return null;
+    try {
+      const file = await this.bot.api.getFile(fileId);
+      const remotePath = file.file_path;
+      if (!remotePath) return null;
+
+      const ext = originalName
+        ? path.extname(originalName)
+        : path.extname(remotePath) || '';
+      const filename = `${prefix}-${Date.now()}${ext}`;
+      const dir = path.join(DATA_DIR, 'ipc', groupFolder, 'files');
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, filename);
+
+      const url = `https://api.telegram.org/file/bot${this.botToken}/${remotePath}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      fs.writeFileSync(dest, buffer);
+
+      logger.info({ groupFolder, filename }, 'Telegram file downloaded');
+      return `/workspace/ipc/files/${filename}`;
+    } catch (err) {
+      logger.debug({ err, prefix }, 'Failed to download Telegram file');
+      return null;
+    }
   }
 
   async connect(): Promise<void> {
@@ -94,8 +233,15 @@ export class TelegramChannel implements Channel {
       }
 
       // Store chat metadata for discovery
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'telegram', isGroup);
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'telegram',
+        isGroup,
+      );
 
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
@@ -138,8 +284,15 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
 
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -151,15 +304,63 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
-    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) =>
-      storeNonText(ctx, '[Voice message]'),
-    );
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      const photos = ctx.message.photo;
+      const fileId = photos?.[photos.length - 1]?.file_id;
+      if (group && fileId) {
+        const fp = await this.downloadFile(fileId, group.folder, 'photo');
+        storeNonText(ctx, fp ? `[Photo: ${fp}]` : '[Photo]');
+      } else {
+        storeNonText(ctx, '[Photo]');
+      }
+    });
+    this.bot.on('message:video', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      const fileId = ctx.message.video?.file_id;
+      if (group && fileId) {
+        const fp = await this.downloadFile(fileId, group.folder, 'video');
+        storeNonText(ctx, fp ? `[Video: ${fp}]` : '[Video]');
+      } else {
+        storeNonText(ctx, '[Video]');
+      }
+    });
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      const fileId = ctx.message.voice?.file_id;
+      if (group && fileId) {
+        const fp = await this.downloadFile(fileId, group.folder, 'voice');
+        storeNonText(ctx, fp ? `[Voice: ${fp}]` : '[Voice message]');
+      } else {
+        storeNonText(ctx, '[Voice message]');
+      }
+    });
+    this.bot.on('message:audio', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      const fileId = ctx.message.audio?.file_id;
+      if (group && fileId) {
+        const name = ctx.message.audio?.file_name;
+        const fp = await this.downloadFile(fileId, group.folder, 'audio', name);
+        storeNonText(ctx, fp ? `[Audio: ${fp}]` : '[Audio]');
+      } else {
+        storeNonText(ctx, '[Audio]');
+      }
+    });
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
       const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+      const fileId = ctx.message.document?.file_id;
+      if (group && fileId) {
+        const fp = await this.downloadFile(fileId, group.folder, 'doc', name);
+        storeNonText(ctx, fp ? `[Document: ${fp}]` : `[Document: ${name}]`);
+      } else {
+        storeNonText(ctx, `[Document: ${name}]`);
+      }
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
@@ -199,29 +400,59 @@ export class TelegramChannel implements Channel {
 
     try {
       const numericId = jid.replace(/^tg:/, '');
+      const converted = convertToTelegramMarkdownV2(text);
 
       // Telegram has a 4096 character limit per message — split if needed
       const MAX_LENGTH = 4096;
       const chunks =
-        text.length <= MAX_LENGTH
-          ? [text]
-          : Array.from({ length: Math.ceil(text.length / MAX_LENGTH) }, (_, i) =>
-              text.slice(i * MAX_LENGTH, (i + 1) * MAX_LENGTH),
+        converted.length <= MAX_LENGTH
+          ? [converted]
+          : Array.from(
+              { length: Math.ceil(converted.length / MAX_LENGTH) },
+              (_, i) =>
+                converted.slice(i * MAX_LENGTH, (i + 1) * MAX_LENGTH),
             );
 
       for (const chunk of chunks) {
         try {
           await this.bot.api.sendMessage(numericId, chunk, {
-            parse_mode: 'Markdown',
+            parse_mode: 'MarkdownV2',
           });
         } catch {
-          // Fallback to plain text if Markdown parsing fails
+          // Fallback to plain text if MarkdownV2 parsing fails
           await this.bot.api.sendMessage(numericId, chunk);
         }
       }
       logger.info({ jid, length: text.length }, 'Telegram message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
+    }
+  }
+
+  async sendFile(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const ext = path.extname(filePath).toLowerCase();
+      const source = new InputFile(filePath);
+
+      if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) {
+        await this.bot.api.sendPhoto(numericId, source, { caption });
+      } else if (['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
+        await this.bot.api.sendVideo(numericId, source, { caption });
+      } else {
+        await this.bot.api.sendDocument(numericId, source, { caption });
+      }
+      logger.info({ jid, filePath }, 'Telegram file sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
     }
   }
 

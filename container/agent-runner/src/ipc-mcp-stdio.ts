@@ -14,6 +14,7 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const FILES_DIR = path.join(IPC_DIR, 'files');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -59,6 +60,51 @@ server.tool(
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'send_file',
+  `Send a file to the user or group via Telegram. The file must exist at the given path inside the container. Files in /workspace/ipc/files/ are shared with the host and can be sent directly. You can also copy files from /workspace/group/ to /workspace/ipc/files/ first.
+
+Supported types: images (.jpg, .png, .gif, .webp) are sent as photos, videos (.mp4, .mov) as videos, everything else as documents.
+
+Telegram limits: max 50MB for uploads.`,
+  {
+    filePath: z.string().describe('Absolute path to the file inside the container (e.g., /workspace/ipc/files/result.png)'),
+    caption: z.string().optional().describe('Optional caption/description for the file'),
+  },
+  async (args) => {
+    // Verify file exists
+    if (!fs.existsSync(args.filePath)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.filePath}` }],
+        isError: true,
+      };
+    }
+
+    // If file is not already in IPC files dir, copy it there
+    let ipcFilePath = args.filePath;
+    if (!args.filePath.startsWith(FILES_DIR)) {
+      const filename = `out-${Date.now()}-${path.basename(args.filePath)}`;
+      const dest = path.join(FILES_DIR, filename);
+      fs.mkdirSync(FILES_DIR, { recursive: true });
+      fs.copyFileSync(args.filePath, dest);
+      ipcFilePath = dest;
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'send_file',
+      chatJid,
+      filePath: ipcFilePath,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `File queued for sending: ${path.basename(ipcFilePath)}` }] };
   },
 );
 
